@@ -128,7 +128,7 @@ install_dependencies() {
       $SUDO apt update
       $SUDO apt install -y libhwloc-dev pkg-config
       ;;
-    fedora|rhel|centos|rocky|almalinux)
+    fedora|rhel|centos|rocky|almalinux|KeyarchOS)
       echo "Detected Red Hat-based system. Installing hwloc-devel and pkgconfig..."
       $SUDO dnf install -y hwloc-devel pkgconfig || $SUDO yum install -y hwloc-devel pkgconfig
       ;;
