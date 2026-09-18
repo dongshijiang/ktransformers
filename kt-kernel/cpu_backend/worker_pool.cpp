@@ -71,7 +71,9 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
       // printf("Failed to set thread name: %s\n", name);
     }
     // Set the thread affinity to the specified NUMA node's CPU
-    numa_obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, numa_id);
+    // Use OS index (P#) lookup: hwloc logical index (L#) may differ on machines
+    // with memory-only nodes (e.g. CXL).
+    numa_obj = hwloc_get_numanode_obj_by_os_index(topology, numa_id);
     if (!numa_obj) {
       fprintf(stderr, "NUMA node %d not found\n", numa_id);
       // throw std::runtime_error("NUMA node not found");
@@ -293,7 +295,10 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
     pthread_t native_handle = workers[i].native_handle();
     pthread_setname_np(native_handle, thread_name.c_str());
     // Set the thread affinity to the specified NUMA node's CPU (0)
-    numa_obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, this_numa);
+    // Look up by OS index (P#), not hwloc logical index (L#): they differ on
+    // machines with memory-only nodes (e.g. CXL), which would bind the
+    // distributor thread to the wrong node's cores (or fail on CXL nodes).
+    numa_obj = hwloc_get_numanode_obj_by_os_index(topology, this_numa);
     if (!numa_obj) {
       fprintf(stderr, "NUMA node %d not found\n", this_numa);
       // throw std::runtime_error("NUMA node not found");

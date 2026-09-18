@@ -37,8 +37,11 @@ inline void set_memory_to_numa(int this_numa) {
   hwloc_topology_t topology;
   hwloc_topology_init(&topology);
   hwloc_topology_load(topology);
-
-  hwloc_obj_t obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, this_numa);
+	
+  // Look up by OS index (P#), not hwloc logical index (L#): they differ on
+  // machines with memory-only nodes (e.g. CXL), which would silently bind
+  // worker memory to the wrong node.
+  hwloc_obj_t obj = hwloc_get_numanode_obj_by_os_index(topology, this_numa);
   if (!obj) {
     fprintf(stderr, "NUMA node %d not found.\n", this_numa);
     hwloc_topology_destroy(topology);
