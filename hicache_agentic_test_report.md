@@ -8,16 +8,35 @@
 
 ### 1.1 测试环境
 
+**硬件**
+
 | 项 | 值 |
 |---|---|
-| GPU | 2× NVIDIA L20 48GB，TP=2 |
+| GPU | 2× NVIDIA L20 48GB（TP=2），驱动 570.195.03 / CUDA 12.8 |
+| CPU | 2× Intel Xeon 6767P（256 逻辑核 / 4 NUMA，支持 AMX） |
+| 内存 | 1006GB（4 NUMA 节点交错，host 池 + cudaHostRegister） |
+| 模型权重 | DeepSeek-V4-Flash，磁盘占用 149GB（MXFP4 专家 + BF16 注意力混合精度），常驻主机内存 |
+
+**软件**
+
+| 项 | 值 |
+|---|---|
+| 操作系统 | KeyarchOS 5.10（浪潮 KOS） |
+| 运行环境 | Docker 24.0.9，Python 3.11.6，conda env kt-sglang（SGLang dongshijiang fork，kt-v0.6.3 分支 @ 9e0a481a4） |
+| 环境变量 | SGLANG_DSV4_MODE=2604 / SUBMODE=2604B、SGLANG_SWA_SHADOW_SLOT=1 |
+
+**推理配置**
+
+| 项 | 值 |
+|---|---|
 | 模型 | DeepSeek-V4-Flash（43 层混合架构，sliding_window=128，MLA kv_heads=1 / head_dim=512） |
 | 量化/加速 | KT MXFP4，`--kt-num-gpu-experts 30 --kt-cpuinfer 128 --kt-threadpool-count 4 --kt-enable-dynamic-expert-update` |
 | KV 池（L1） | `--max-total-tokens 131072 --swa-full-tokens-ratio 1.0`（full/swa 各 131k） |
-| 通用参数 | `--chunked-prefill-size 2048 --max-prefill-tokens 2048 --max-running-requests 32 --context-length 16384 --mem-fraction-static 0.85` |
-| HiCache 组（L2） | 追加 `--enable-hierarchical-cache --hicache-mem-layout layer_first --hicache-io-backend kernel --hicache-ratio 2`（host 池 = 2×131k = 262k tokens，1024 blocks × 996864 B） |
+| 通用参数 | `--chunked-prefill-size 2048 --max-prefill-tokens 2048 --max-running-requests 32 --context-length 16384 --mem-fraction-static 0.85 --attention-backend flashinfer` |
+| HiCache 组（L2） | 追加 `--enable-hierarchical-cache --hicache-mem-layout layer_first --hicache-io-backend kernel --hicache-ratio 2`（host 池 = 2×131k = 262k tokens，1024 blocks × 996864 B ≈ 1.0GB） |
 | base 组 | 同配置去掉 HiCache 参数（对照组） |
-| 运行环境 | SGLANG_DSV4_MODE=2604 / SUBMODE=2604B、SGLANG_SWA_SHADOW_SLOT=1，conda env kt-sglang |
+
+**最小内存要求**：权重 149GB（mmap 常驻页缓存）+ 推理运行时 ≈75GB（激活、KV 索引、expert staging、框架开销）+ HiCache host 池 ≈1GB → **最低 256GB，推荐 ≥512GB**（权重页缓存全驻留 + 多 NUMA 交错带宽收益；实测整机已用 224GB / 页缓存 187GB）。
 
 ### 1.2 场景定义
 
@@ -56,6 +75,7 @@ n=32（池满边界场景）逐轮 TTFT（32 会话均值）：
 |---|---|---|
 | cold TTFT | 51.3s（cached=0 全量 prefill） | 49.7s（cached=0 全量 prefill） |
 | refill TTFT（重问同题） | 49.4s（cached=0，GPU 池已被驱逐，全量重算） | 0.50s（cached=12288，48 页整页回迁 + 24 token 尾部重算） |
+| 解码 TPOT（50 token 生成） | 44.1ms | 45.0ms（回迁轮解码速度与全量 prefill 一致） |
 | similarity | 1.0（两次全量自比） | 0.696 |
 | refill 输出 | 正常 | 事实内容完整（正确概括原文主题），措辞与 cold 轮存在改写（成因见 4.4） |
 
@@ -86,6 +106,40 @@ n=32（池满边界场景）逐轮 TTFT（32 会话均值）：
 | 调度器账本（swa/full token 统计） | 全程无异常读数 |
 | 字节级校验轮（开启 SGLANG_P2_VERIFY 探针的独立验证轮：迁出 D2H 读回比对 + 全部回迁 H2D 逐字节比对） | 全程 0 失配；探针开销使 refill TTFT 0.49s→3.7s（生产默认关闭） |
 
+### 2.6 基线与 HiCache 组性能对比总表
+
+TTFT（cold=首轮 mean / warm=第 2-8 轮 mean）：
+
+| n | base cold | HiCache cold | base warm | HiCache warm | warm 收益 |
+|---|---|---|---|---|---|
+| 1 | 18.6s | 18.6s | 4.4s | 3.9s | 1.1× |
+| 4 | 50.6s | 51.1s | 8.4s | 9.6s | 0.88×（写回开销） |
+| 8 | 87.9s | 88.2s | 13.0s | 16.6s | 0.78×（写回开销） |
+| 16 | 161.5s | 162.0s | 24.9s | 25.7s | 0.97× |
+| 32 | 308.7s | 309.3s | 436.1s | 68.6s | **6.4×** |
+
+解码 TPOT / TPS（warm 轮 mean；TPS=1000/TPOT 为单会话解码速度）：
+
+| n | base TPOT | HiCache TPOT | base TPS | HiCache TPS | HiCache 聚合 TPS（n×） |
+|---|---|---|---|---|---|
+| 1 | 43.3ms | 39.8ms | 23.1 tok/s | 25.1 tok/s | 25.1 |
+| 4 | 442.8ms | 585.7ms | 2.26 | 1.71 | 6.83 |
+| 8 | 1041.8ms | 1385.2ms | 0.96 | 0.72 | 5.78 |
+| 16 | 3450.8ms | 3732.7ms | 0.29 | 0.27 | 4.29 |
+| 32 | 28039.8ms | 3473.6ms | 0.04 | 0.29 | **9.21** |
+
+数据正确性：marker（8→256 全对）、needle（3/3）两组全对；T3 回迁轮事实完整。
+
+### 2.7 TTFT / TPS 变化曲线
+
+![图1 TTFT 随并发数变化：cold 两组逐档持平；warm 在 n≤16 因写回开销小幅落后（n=4/8 为 14~28%），n=32 池满场景 HiCache 68.6s vs base 436.1s（6.4×）](hicache_report_figs/fig1_ttft_vs_n.png)
+
+![图2 解码 TPS 随并发数变化：单会话解码速度由 CPU 专家算力决定（n=1 约 25 tok/s），n=4/8 HiCache 因写回竞争退化约 30%，n=32 池满场景 base 解码崩塌（0.04 tok/s）而 HiCache 保持 0.29 tok/s（聚合 9.2 tok/s，8×）](hicache_report_figs/fig2_tps_vs_n.png)
+
+![图3 TTFT 随输入长度变化（逐轮，n=1/n=32 + T3 12.3k 点位）：两组 cold 曲线重合；池满（n=32）后 HiCache 各轮稳定在 52~136s，base 同轮 266~563s 且逐轮恶化；12.3k 驱逐回迁点 HiCache 0.50s vs base 49.4s](hicache_report_figs/fig3_ttft_vs_inputlen.png)
+
+![图4 解码 TPS 随输入长度变化（逐轮）：输入变长单会话解码速度缓慢下降（注意力计算量增加）；n=32 池满后 HiCache 各轮解码速度为 base 的 4~10 倍](hicache_report_figs/fig4_tps_vs_inputlen.png)
+
 ---
 
 ## 3. 测试结论
@@ -93,8 +147,9 @@ n=32（池满边界场景）逐轮 TTFT（32 会话均值）：
 1. **回迁收益显著**：单会话 12k 前缀回迁 TTFT 0.50s vs 全量重算 49.4s（≈ 99 倍）；池满压力场景（n=32）HiCache 组热态轮 TTFT 均值 68.6s vs base 组 436.1s（6.4 倍，去除驱逐尾巴后的稳态 52~64s 为 6.8~8.4 倍），冷态首轮两组持平（309.3s vs 308.7s）。
 2. **数据正确性全绿**：确定性检索判据全对（T1 marker 256/256、needle 3/3），字节级校验 0 失配——迁出、驱逐、回迁整条搬运链数据无损。
 3. **多会话并发回迁有效**：T4 并发回迁 p50 17.5s vs base 26.1s（1.49 倍），回迁命中率 96.9%；收益受并发带宽竞争制约（见 4.3）。
-4. **无驱逐场景存在小幅写回开销**：池未满（n≤16，GPU radix 全命中、HiCache 不参与搬运）时，n=4/8 场景 HiCache 组 warm 比 base 慢 14~28%，n=1/16 基本持平（-11%~+3%），来源是 write_through 策略下每请求完成即触发 D2H 迁出。
-5. **容量边界结论**：131k GPU 池的并发承载上限约 24 路 4k 会话（base 组 n=32 池满排队 warm 436s）；host 池 2× 扩容后该场景热态 TTFT 稳定在 52~68s 量级，是长会话/多会话产品形态的基础设施收益。
+4. **解码吞吐在池满场景被稳定保住**：单会话解码速度由 CPU 专家算力决定（n=1 约 25 tok/s），两组一致；池满场景（n=32）HiCache 组解码 TPOT 3.47s vs base 28.0s（**8×**），HiCache 同时保住了 TTFT 与解码不崩塌。n=4/8 写回竞争使解码退化约 30%（见 4.5）。
+5. **无驱逐场景存在小幅写回开销**：池未满（n≤16，GPU radix 全命中、HiCache 不参与搬运）时，n=4/8 场景 HiCache 组 warm 比 base 慢 14~28%，n=1/16 基本持平（-11%~+3%），来源是 write_through 策略下每请求完成即触发 D2H 迁出。
+6. **容量边界结论**：131k GPU 池的并发承载上限约 24 路 4k 会话（base 组 n=32 池满排队 warm 436s）；host 池 2× 扩容后该场景热态 TTFT 稳定在 52~68s 量级，是长会话/多会话产品形态的基础设施收益。
 
 ---
 
@@ -121,7 +176,11 @@ T3 refill 轮与 cold 轮输出措辞存在改写（sim 0.696~0.789），为**�
 - 两条路径的 kernel 归约顺序存在浮点级差异，贪心解码下个别 token 位置 argmax 翻转，引发后续措辞改写；
 - refill 输出对原文主题的事实概括完整无误，且全场景确定性检索（256 marker + 3 needle）精确命中，字节级校验 0 失配——数据正确性以确定性判据为准，similarity 仅作参考。
 
-### 4.5 适用场景建议
+### 4.5 解码 TPOT 曲线解读
+
+解码速度的基线由 CPU 专家算力决定：n=1 时 TPOT ≈ 40ms（25 tok/s），与 HiCache 无关（T3 回迁轮 45.0ms vs cold 44.1ms，一致）。两条曲线的分化全部来自**调度干扰**：n=4/8 时 HiCache 的后台 D2H 迁出与解码争用 CPU/带宽，TPOT 退化约 30%；n=32 池满后 base 组的解码在"重算排队 + retract 重试"下崩塌（TPOT 28.0s），HiCache 组因驱逐内容可回迁，无重算队列，TPOT 稳定在 2.4~4.1s。结论：**HiCache 不提升解码算力上限，但消除了容量不足导致的解码崩塌；中并发段（n=4/8）的写回干扰可通过选择性迁出策略（按前缀命中次数门控 D2H）收敛。**
+
+### 4.6 适用场景建议
 
 | 场景 | 建议 |
 |---|---|
